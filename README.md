@@ -1,4 +1,4 @@
-# <img src="./logo.svg" height="25" /> Clipanion
+# <img src="./logo.svg" height="25" /> Griselbrand
 
 > Daemon helper for [Clipanion](https://github.com/arcanis/clipanion)
 
