@@ -16,34 +16,158 @@ Griselbrand is a companion library for [Clipanion](https://github.com/arcanis/cl
 
 ## Overview
 
+Griselbrand is intended to be very simple to use. Compared to the typical Clipanion code, here are the changes needed:
 
-Griselbrand is intended to be very simple to use. The main thing is to annotate the commands that need to be run within a daemon context. In the following example, calling the script will cause a counter to be printed on screen, incremented at each invocation thanks to the `daemon.register(execute)` wrapper:
+- Use `DaemonContext` when creating your CLI instance
+- Wrap the `execute` functions from your commands inside `daemon.register`
+- Use `daemon.runExit(cli, ...)` instead of `cli.runExit(...)`
+
+And that's it! All commands wrapped by `daemon.register` will be evaluated within a daemon context, with their output being transparently forwarded to the client. For instance, the following example will make a cli that, when called, will cause the script to print a incrementing counter on screen:
 
 ```ts
-import {Cli, Command} from 'clipanion';
-import {Daemon}       from 'griselbrand';
+import {Cli, Command}          from 'clipanion';
+import {Daemon, DaemonContext} from 'griselbrand';
 
-const daemon = new Daemon({port: 6532});
+const cli = new Cli<DaemonContext>();
+const daemon = new Daemon<DaemonContext>({port: 6532});
 
 let counter = 0;
 
-const cli = Cli.from([
-  ...daemon.getControlCommands(),
+cli.register(
   class MyCommand extends Command {
     execute = daemon.register(async () => {
       this.context.stdout.write(`Counter: ${counter++}\n`);
     });
   },
-]);
+);
 
 daemon.runExit(cli, process.argv.slice(2));
 ```
 
-Adding the commands provided by `daemon.getControlCommands()` to your CLI is optional and will automatically expose CLI commands for `status`/`start`/`stop`/`restart`. You can also implement them yourself by calling the relevant functions from the `daemon` instance.
+## Daemon management
+
+The `Daemon` API provides function to start/stop/restart/get the status of the running daemon. If you wish to expose those features from the CLI, you can either implement yourself commands that leverage this API, or use `daemon.getControlCommands()`. This function will return a set of preconfigured control commands that you can then inject into the CLI. You can also optionally provide an array to the function, which will be prepended to each generated command path (for instance if you wish the `start` command to be exposed as `daemon start` rather than just `start`).
+
+```ts
+import {Cli, Command}          from 'clipanion';
+import {Daemon, DaemonContext} from 'griselbrand';
+
+const cli = new Cli<DaemonContext>();
+const daemon = new Daemon<DaemonContext>({port: 6532});
+
+for (const command of daemon.getControlCommands())
+  cli.register(command);
+
+daemon.runExit(cli, process.argv.slice(2));
+```
+
+## Watch support
+
+Griselbrand doesn't provide watch support by default, but you can easily add it by using the `onStart` API:
+
+```ts
+import chokidar                from 'chokidar';
+import {Cli, Command}          from 'clipanion';
+import {Daemon, DaemonContext} from 'griselbrand';
+
+const cli = new Cli<DaemonContext>();
+const daemon = new Daemon<DaemonContext>({port: 6532});
+
+daemon.onStart.add(async () => {
+  const watcher = chokidar.watch(`.`);
+
+  // Don't forget to wrap into the `ready` event, otherwise chokidar
+  // will cause your daemon to keep restarting itself
+  watcher.on(`ready`, () => {
+    watcher.on(`all`, () => {
+      daemon.restart();
+    });
+  });
+});
+
+cli.register(
+  class MyCommand extends Command {
+    execute = daemon.register(async () => {
+      this.context.stdout.write(`Counter: ${counter++}\n`);
+    });
+  },
+);
+
+daemon.runExit(cli, process.argv.slice(2));
+```
+
+## Cancellations
+
+In some cases you may want to provide long-running commands that don't end by themselves (for instance when displaying a live stream of data). Unless you take special care, users aborting the connection via <kbd>Ctrl+C</kbd> won't cause the long-running commands to be aborted, leading to memory and CPU leaks.
+
+To avoid this issue, Griselbrand provides two ways to be notified when the user disconnects:
+
+- `this.context.clientStatus.current` is a boolean set to false when the client disconnects
+- `this.context.onClientDisconnect` is a set of functions to execute when the client disconnects
+
+You can use any of these mechanisms to decide when to end the command:
+
+```ts
+import {Cli, Command}          from 'clipanion';
+import {Daemon, DaemonContext} from 'griselbrand';
+import {setTimeout}            from 'timers/promises';
+
+const cli = new Cli<DaemonContext>();
+const daemon = new Daemon<DaemonContext>({port: 6532});
+
+cli.register(
+  class MyCommand extends Command {
+    execute = daemon.register(async () => {
+      const controller = new AbortController();
+      const signal = controller.signal;
+
+      this.context.onClientDisconnect.add(async () => {
+        controller.abort();
+      });
+
+      while (this.context.clientStatus.current) {
+        await fetch(`https://example.org/some/large/payload`, {signal});
+        await setTimeout(1000);
+      }
+    });
+  },
+);
+
+daemon.runExit(cli, process.argv.slice(2));
+```
+
+## Color support
+
+Since the daemon runs within a detached process, tools that attempt to feature-detect whether the current terminal supports colors won't work properly. This can be somewhat mitigated by forwarding the environment to the daemon through the context and detecting the supported colorset there, using [`getColorDepth`](https://nodejs.org/api/tty.html#tty_writestream_getcolordepth_env). For convenience, Griselbrand re-export it:
+
+```ts
+import {Cli, Command}                         from 'clipanion';
+import {Daemon, DaemonContext, getColorDepth} from 'griselbrand';
+
+type Context = DaemonContext & {
+  env: typeof process.env;
+};
+
+const cli = new Cli<Context>();
+const daemon = new Daemon<Context>({port: 6532});
+
+cli.register(
+  class MyCommand extends Command<Context> {
+    execute = daemon.register(async () => {
+      const supportedColorDepth = getColorDepth(this.context.env);
+      this.context.stdout.write(`Supported colorset: ${supportedColorDepth}\n`);
+    });
+  },
+);
+
+daemon.runExit(cli, process.argv.slice(2), {
+  env: process.env,
+});
+```
 
 ## License (MIT)
 
-> **Copyright © 2019 Mael Nison**
+> **Copyright © 2021 Mael Nison**
 >
 > Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 >

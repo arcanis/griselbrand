@@ -1,7 +1,11 @@
-import {fork}                                           from 'child_process';
-import {Cli, Command, CommandClass, Option, UsageError} from 'clipanion';
-import {PassThrough}                                    from 'stream';
-import WebSocket, {WebSocketServer}                     from 'ws';
+import {fork}                                                        from 'child_process';
+import {BaseContext, Cli, Command, CommandClass, Option, UsageError} from 'clipanion';
+import {PassThrough}                                                 from 'stream';
+import tty                                                           from 'tty';
+import WebSocket, {WebSocketServer}                                  from 'ws';
+
+type MakeOptional<T, Keys extends keyof T> = Omit<T, Keys> & Partial<Pick<T, Keys>>;
+type VoidIfEmpty<T> = keyof T extends never ? void : never;
 
 const log = (...data: Array<any>) => {
   if (process.env.DEBUG_DAEMON === `1`) {
@@ -12,22 +16,37 @@ const log = (...data: Array<any>) => {
 const isInsideDaemon = process.env.CLIPANION_DAEMON === `1`;
 log(process.pid, `is daemon?`, isInsideDaemon);
 
+export const getColorDepth = tty.WriteStream.prototype.getColorDepth;
+export const hasColors = tty.WriteStream.prototype.hasColors;
+
+export type DaemonContext = BaseContext & {
+  onClientDisconnect: Set<() => Promise<void>>;
+};
+
 export type DaemonOptions = {
   port: number;
 };
 
-export class Daemon {
+export class Daemon<Context extends DaemonContext = DaemonContext> {
   public port: number;
+
+  public readonly onStart = new Set<() => Promise<void>>();
+  public readonly onStop = new Set<() => Promise<void>>();
+
+  public readonly env: Record<string, string> = {};
+
+  private wss?: WebSocketServer;
+  private rebootInProgress = false;
 
   constructor({port}: DaemonOptions) {
     this.port = port;
   }
 
-  getControlCommands(mountPath: Array<string> = []): Array<CommandClass> {
+  getControlCommands(mountPath: Array<string> = []): Array<CommandClass<Context>> {
     const daemon = this;
 
     return [
-      class StartCommand extends Command {
+      class StartCommand extends Command<Context> {
         static paths = [[...mountPath, `status`]];
 
         static usage = Command.Usage({
@@ -51,7 +70,7 @@ export class Daemon {
         }
       },
 
-      class StartCommand extends Command {
+      class StartCommand extends Command<Context> {
         static paths = [[...mountPath, `start`]];
 
         static usage = Command.Usage({
@@ -64,7 +83,7 @@ export class Daemon {
         }
       },
 
-      class StopCommand extends Command {
+      class StopCommand extends Command<Context> {
         static paths = [[...mountPath, `stop`]];
 
         static usage = Command.Usage({
@@ -77,7 +96,7 @@ export class Daemon {
         }
       },
 
-      class RestartCommand extends Command {
+      class RestartCommand extends Command<Context> {
         static paths = [[...mountPath, `restart`]];
 
         static usage = Command.Usage({
@@ -130,11 +149,19 @@ export class Daemon {
   }
 
   async start() {
+    if (isInsideDaemon)
+      throw new Error(`Cannot call .start() from within the daemon process`);
+
     const ws = await this.open();
     ws.close();
   }
 
   async stop() {
+    if (isInsideDaemon) {
+      this.wss?.close();
+      return;
+    }
+
     let ws: WebSocket;
     try {
       ws = await this.open({autoSpawn: false});
@@ -151,8 +178,16 @@ export class Daemon {
   }
 
   async restart() {
-    await this.stop();
-    await this.start();
+    if (isInsideDaemon) {
+      if (!this.rebootInProgress) {
+        this.rebootInProgress = true;
+        this.wss?.close();
+        await this.spawn();
+      }
+    } else {
+      await this.stop();
+      await this.start();
+    }
   }
 
   register(fn: () => Promise<number | void>): () => Promise<number | void> {
@@ -168,10 +203,13 @@ export class Daemon {
     return async function (this: Command) {
       const ws = await daemon.open();
 
+      const {stdin, stdout, stderr, ...context} = this.context;
+
       ws.send(JSON.stringify({
         type: `cli`,
         args: process.argv.slice(2),
         version: this.cli.binaryVersion,
+        context,
       }));
 
       return await new Promise((resolve, reject) => {
@@ -202,23 +240,40 @@ export class Daemon {
     };
   }
 
-  async runExit(cli: Cli, argv: Array<string>) {
+  async runExit(cli: Cli<Context>, argv: Array<string>, context: VoidIfEmpty<Omit<Context, keyof DaemonContext>>): Promise<void>;
+  async runExit(cli: Cli<Context>, argv: Array<string>, context: MakeOptional<Context, keyof DaemonContext>): Promise<void>;
+  async runExit(cli: Cli<Context>, argv: Array<string>, context: any) {
     if (!isInsideDaemon) {
       log(`running the cli`);
-      return cli.runExit(argv, Cli.defaultContext);
+      return cli.runExit(argv, {...context, onClientDisconnect: new Set()});
     }
+
+    if (typeof this.wss !== `undefined`)
+      throw new Error(`Daemons can only start once`);
 
     log(`server starting`);
     return new Promise<void>((resolve, reject) => {
-      const wss = new WebSocketServer({
+      const wss = this.wss = new WebSocketServer({
         port: this.port,
       });
 
-      wss.on(`listening`, () => {
+      wss.on(`listening`, async () => {
+        for (const fn of this.onStart)
+          await fn();
+
         process.send?.(`ready`);
       });
 
       wss.on(`connection`, ws => {
+        const onClientDisconnect = new Set<() => Promise<void>>();
+
+        ws.on(`close`, async () => {
+          for (const fn of onClientDisconnect)
+            await fn();
+
+          resolve();
+        });
+
         ws.on(`message`, message => {
           const send = (data: any) => {
             ws.send(JSON.stringify(data));
@@ -246,7 +301,6 @@ export class Daemon {
 
             case `stop`: {
               wss.close();
-              resolve();
             } break;
 
             case `cli`: {
@@ -259,7 +313,8 @@ export class Daemon {
               }
 
               cli.run(payload.args, {
-                ...Cli.defaultContext,
+                ...payload.context,
+                onClientDisconnect,
                 stdout,
               }).then(exitCode => {
                 send({type: `exit`, exitCode});
@@ -273,6 +328,12 @@ export class Daemon {
 
       wss.on(`error`, error => {
         process.stdout.write(cli.error(error));
+      });
+
+      wss.on(`close`, async () => {
+        for (const fn of this.onStop)
+          await fn();
+
         resolve();
       });
     });
@@ -300,6 +361,7 @@ export class Daemon {
         stdio: [`ignore`, `ignore`, `ignore`, `ipc`],
         env: {
           ...process.env,
+          ...this.env,
           CLIPANION_DAEMON: `1`,
         },
       });

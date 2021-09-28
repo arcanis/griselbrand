@@ -1,6 +1,6 @@
 {
   "name": "griselbrand",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "main": "sources/index.ts",
   "license": "MIT",
   "sideEffects": false,
@@ -18,7 +18,8 @@
     "@types/node": "^16.10.1",
     "@types/ws": "^8.2.0",
     "@yarnpkg/eslint-config": "^0.4.0-rc.4",
-    "clipanion": "^3.0.1",
+    "chokidar": "^3.5.2",
+    "clipanion": "^3.2.0-rc.3",
     "eslint": "^7.32.0",
     "rollup": "^2.57.0",
     "ts-node": "^10.2.1",
