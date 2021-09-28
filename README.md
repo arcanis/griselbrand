@@ -10,11 +10,11 @@
 yarn add griselbrand
 ```
 
-## What is it?
+## Overview
 
 Griselbrand is a companion library for [Clipanion](https://github.com/arcanis/clipanion). It lets you transparently run some commands of your CLI inside a daemon process, thus preserving the state between calls.
 
-## Overview
+## Usage
 
 Griselbrand is intended to be very simple to use. Compared to the typical Clipanion code, here are the changes needed:
 
@@ -57,41 +57,6 @@ const daemon = new Daemon<DaemonContext>({port: 6532});
 
 for (const command of daemon.getControlCommands())
   cli.register(command);
-
-daemon.runExit(cli, process.argv.slice(2));
-```
-
-## Watch support
-
-Griselbrand doesn't provide watch support by default, but you can easily add it by using the `onStart` API:
-
-```ts
-import chokidar                from 'chokidar';
-import {Cli, Command}          from 'clipanion';
-import {Daemon, DaemonContext} from 'griselbrand';
-
-const cli = new Cli<DaemonContext>();
-const daemon = new Daemon<DaemonContext>({port: 6532});
-
-daemon.onStart.add(async () => {
-  const watcher = chokidar.watch(`.`);
-
-  // Don't forget to wrap into the `ready` event, otherwise chokidar
-  // will cause your daemon to keep restarting itself
-  watcher.on(`ready`, () => {
-    watcher.on(`all`, () => {
-      daemon.restart();
-    });
-  });
-});
-
-cli.register(
-  class MyCommand extends Command {
-    execute = daemon.register(async () => {
-      this.context.stdout.write(`Counter: ${counter++}\n`);
-    });
-  },
-);
 
 daemon.runExit(cli, process.argv.slice(2));
 ```
@@ -164,6 +129,53 @@ daemon.runExit(cli, process.argv.slice(2), {
   env: process.env,
 });
 ```
+
+## Development
+
+Daemons need to run as detached process, outside of any tty, making them somewhat difficult to debug. To mitigate this issue, Griselbrand lets you easily spawn the daemon yourself as a regular process:
+
+```
+CLIPANION_DAEMON=1 node ./path/to/cli.js
+```
+
+You'll then be able to run commands as usual, which will execute within the context of the process you started.
+
+## Watch support
+
+Griselbrand doesn't provide watch support by default, but you can easily add it by using the `onStart` API:
+
+```ts
+import chokidar                from 'chokidar';
+import {Cli, Command}          from 'clipanion';
+import {Daemon, DaemonContext} from 'griselbrand';
+
+const cli = new Cli<DaemonContext>();
+const daemon = new Daemon<DaemonContext>({port: 6532});
+
+daemon.onStart.add(async () => {
+  const watcher = chokidar.watch(`.`);
+
+  // Don't forget to wrap into the `ready` event, otherwise chokidar
+  // will cause your daemon to keep restarting itself
+  watcher.on(`ready`, () => {
+    watcher.on(`all`, () => {
+      daemon.restart();
+    });
+  });
+});
+
+cli.register(
+  class MyCommand extends Command {
+    execute = daemon.register(async () => {
+      this.context.stdout.write(`Counter: ${counter++}\n`);
+    });
+  },
+);
+
+daemon.runExit(cli, process.argv.slice(2));
+```
+
+Note that this implementation doesn't work with the `CLIPANION_DAEMON=1` trick mentioned in the previous section, as it will cause the process to be exited and respawned as a detached process. In this particular case, tools like [`nodemon`](https://github.com/remy/nodemon) may be a better fit.
 
 ## License (MIT)
 
