@@ -67,7 +67,7 @@ In some cases you may want to provide long-running commands that don't end by th
 
 To avoid this issue, Griselbrand provides two ways to be notified when the user disconnects:
 
-- `this.context.clientStatus.current` is a boolean set to false when the client disconnects
+- `this.context.clientStatus.connected` is a boolean set to false when the client disconnects
 - `this.context.onClientDisconnect` is a set of functions to execute when the client disconnects
 
 You can use any of these mechanisms to decide when to end the command:
@@ -129,6 +129,36 @@ daemon.runExit(cli, process.argv.slice(2), {
   env: process.env,
 });
 ```
+
+## Custom messages
+
+Messages can be sent to the daemon without going through the CLI using `daemon.send`. It'll return an object with a promise that resolves once the daemon finished processing the request, and an `onMessage` handler called at will by daemon via the `sendClientMessage` function:
+
+```ts
+import {Daemon} from 'griselbrand';
+
+const daemon = new Daemon({port: 6532});
+
+daemon.onMessage = async ([a, b], {sendClientMessage}) => {
+  send(`foo`);
+  send(`bar`);
+  return a + b;
+};
+
+if (!daemon.isInsideDaemon) {
+  const request = daemon.send([10, 20]);
+  
+  request.onMessage.add(async () => {
+    console.log(`Daemon sent ${res}`)
+  });
+
+  request.done.then(res => {
+    console.log(`Daemon answered with ${res}`);
+  });
+}
+```
+
+Custom message handlers have also access to `clientStatus` and `onClientDisconnect`, which you can use to stop processing once the client disconnects (see [Cancellations](#Cancellations) for details).
 
 ## Development
 

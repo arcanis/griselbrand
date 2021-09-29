@@ -22,9 +22,45 @@ daemon.onStart.add(async () => {
   });
 });
 
+daemon.onMessage = async (size: any, {clientStatus, sendClientMessage}) => {
+  const data: Array<Buffer> = [];
+  const memory = () => process.memoryUsage().arrayBuffers / 1024 / 1024;
+
+  for (let t = 0; t < 1000 && clientStatus.connected; ++t) {
+    data.push(Buffer.alloc(size, 0));
+    sendClientMessage(memory());
+    await setTimeout(1);
+  }
+
+  return memory();
+};
+
 //Automatically expose start/stop/status commands
 for (const command of daemon.getControlCommands())
   cli.register(command);
+
+cli.register(
+  class MemoryCommand extends Command<Context> {
+    static paths = [[`memory`]];
+    async execute() {
+      // Note: this command is purposefully more complex than it could. In
+      // practice, you'd just make it a regular daemon command, not a custom
+      // request.
+
+      const req = await daemon.send(1024 * 1024 * 1024, {
+        autoSpawn: true,
+      });
+
+      req.onMessage.add(async data => {
+        this.context.stdout.write(`Received: ${JSON.stringify(data)} MB\n`);
+      });
+
+      await req.done.then(value => {
+        this.context.stdout.write(`Returned: ${JSON.stringify(value)} MB\n`);
+      });
+    }
+  },
+);
 
 cli.register(
   class UptimeCommand extends Command<Context> {
@@ -39,15 +75,9 @@ cli.register(
   class LiveCommand extends Command<Context> {
     static paths = [[`live`]];
     execute = daemon.register(async () => {
-      let disconnected = false;
-
-      this.context.onClientDisconnect.add(async () => {
-        disconnected = true;
-      });
-
       const data: Array<Buffer> = [];
 
-      while (!disconnected) {
+      while (this.context.clientStatus.connected) {
         data.push(Buffer.alloc(1024 * 1024 * 1024, 0));
         this.context.stdout.write(`${process.memoryUsage().arrayBuffers / 1024 / 1024} MB (${data.length})\n`);
         await setTimeout(1);

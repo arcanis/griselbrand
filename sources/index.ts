@@ -19,8 +19,13 @@ log(process.pid, `is daemon?`, isInsideDaemon);
 export const getColorDepth = tty.WriteStream.prototype.getColorDepth;
 export const hasColors = tty.WriteStream.prototype.hasColors;
 
+export type ClientStatus = {
+  connected: boolean;
+};
+
 export type DaemonContext = BaseContext & {
   onClientDisconnect: Set<() => Promise<void>>;
+  clientStatus: ClientStatus;
 };
 
 export type DaemonOptions = {
@@ -30,16 +35,33 @@ export type DaemonOptions = {
 export class Daemon<Context extends DaemonContext = DaemonContext> {
   public port: number;
 
+  public readonly env: Record<string, string> = {};
+
   public readonly onStart = new Set<() => Promise<void>>();
   public readonly onStop = new Set<() => Promise<void>>();
 
-  public readonly env: Record<string, string> = {};
+  public onMessage?: (message: unknown, opts: {
+    clientStatus: ClientStatus;
+    onClientDisconnect: Set<() => Promise<void>>,
+    sendClientMessage: (response: unknown) => void,
+  }) => Promise<unknown>;
 
   private wss?: WebSocketServer;
+
   private rebootInProgress = false;
+
+  private messages = new Map<number, {
+    onMessage: Set<(data: unknown) => Promise<void>>;
+    resolve: (data: unknown) => void;
+    reject: (err: Error) => void;
+  }>();
 
   constructor({port}: DaemonOptions) {
     this.port = port;
+  }
+
+  get isInsideDaemon() {
+    return isInsideDaemon;
   }
 
   getControlCommands(mountPath: Array<string> = []): Array<CommandClass<Context>> {
@@ -156,6 +178,30 @@ export class Daemon<Context extends DaemonContext = DaemonContext> {
     ws.close();
   }
 
+  async send(data: unknown, {autoSpawn = false}: {autoSpawn?: boolean} = {}) {
+    if (isInsideDaemon)
+      throw new Error(`Cannot call .message() from within the daemon process`);
+
+    let id: number;
+    do {
+      id = Math.floor(Math.random() * 0x100000000);
+    } while (this.messages.has(id));
+
+    const onMessage = new Set<(data: unknown) => Promise<void>>();
+    const done = this.open({autoSpawn}).then(ws => {
+      const done = new Promise<unknown>((resolve, reject) => {
+        this.messages.set(id, {onMessage, resolve, reject});
+        ws.send(JSON.stringify({type: `message`, id, data}));
+      });
+
+      return done.finally(() => {
+        ws.close();
+      });
+    });
+
+    return {onMessage, done};
+  }
+
   async stop() {
     if (isInsideDaemon) {
       this.wss?.close();
@@ -224,10 +270,7 @@ export class Daemon<Context extends DaemonContext = DaemonContext> {
 
             case `error`: {
               ws.close();
-              const ErrorKlass = payload.error.isUsage ? UsageError : Error;
-              const err = new ErrorKlass(payload.error.message);
-              err.stack = payload.error.stack;
-              reject(err);
+              reject(serializableToError(payload.error));
             } break;
 
             case `exit`: {
@@ -245,7 +288,7 @@ export class Daemon<Context extends DaemonContext = DaemonContext> {
   async runExit(cli: Cli<Context>, argv: Array<string>, context: any) {
     if (!isInsideDaemon) {
       log(`running the cli`);
-      return cli.runExit(argv, {...context, onClientDisconnect: new Set()});
+      return cli.runExit(argv, {...context, clientStatus: {connected: false}, onClientDisconnect: new Set()});
     }
 
     if (typeof this.wss !== `undefined`)
@@ -266,21 +309,24 @@ export class Daemon<Context extends DaemonContext = DaemonContext> {
 
       wss.on(`connection`, ws => {
         const onClientDisconnect = new Set<() => Promise<void>>();
+        const clientStatus: ClientStatus = {connected: true};
 
         ws.on(`close`, async () => {
+          clientStatus.connected = false;
+
           for (const fn of onClientDisconnect)
             await fn();
 
           resolve();
         });
 
-        ws.on(`message`, message => {
+        ws.on(`message`, async message => {
           const send = (data: any) => {
             ws.send(JSON.stringify(data));
           };
 
-          const sendError = (error: Error) => {
-            send({type: `error`, error: {message: error.message, stack: error.stack, isUsage: error instanceof UsageError}});
+          const sendError = (error: unknown) => {
+            send({type: `error`, error: errorToSerializable(error)});
           };
 
           let payload: any;
@@ -295,6 +341,25 @@ export class Daemon<Context extends DaemonContext = DaemonContext> {
           log(`client payload received`, JSON.stringify(payload));
 
           switch (payload.type) {
+            case `message`: {
+              const sendClientMessage = (data: unknown) => send({type: `message/yield`, id: payload.id, data});
+
+              let res: any, error: any, success = false;
+              try {
+                res = await this.onMessage?.(payload.data, {sendClientMessage, onClientDisconnect, clientStatus});
+                success = true;
+              } catch (err) {
+                error = err;
+                success = false;
+              }
+
+              if (success) {
+                send({type: `message/resolve`, id: payload.id, data: res});
+              } else {
+                send({type: `message/reject`, id: payload.id, error: errorToSerializable(error)});
+              }
+            } break;
+
             case `status`: {
               send({type: `status`, version: cli.binaryVersion ?? `<unknown>`});
             } break;
@@ -392,7 +457,66 @@ export class Daemon<Context extends DaemonContext = DaemonContext> {
       throw err;
     }
 
+    ws.on(`message`, async message => {
+      const payload = JSON.parse(message as any);
+
+      switch (payload.type) {
+        case `message/yield`: {
+          const message = this.messages.get(payload.id);
+          if (typeof message === `undefined`)
+            break;
+
+          for (const fn of message.onMessage) {
+            await fn(payload.data);
+          }
+        } break;
+
+        case `message/resolve`: {
+          const message = this.messages.get(payload.id);
+          if (typeof message === `undefined`)
+            break;
+
+          this.messages.delete(payload.id);
+          message.resolve(payload.data);
+        } break;
+
+        case `message/reject`: {
+          const message = this.messages.get(payload.id);
+          if (typeof message === `undefined`)
+            break;
+
+          this.messages.delete(payload.id);
+          message.reject(serializableToError(payload.error));
+        } break;
+      }
+    });
+
     log(`websocket opened`);
     return ws;
   }
+}
+
+type SerializedError = {
+  message: string;
+  stack?: string;
+  isUsage: boolean;
+};
+
+function errorToSerializable(data: unknown): SerializedError {
+  const error = data instanceof Error
+    ? data
+    : new Error(`Not an error: ${JSON.stringify(data)}`);
+
+  return {
+    message: error.message,
+    stack: error.stack,
+    isUsage: error instanceof UsageError,
+  };
+}
+
+function serializableToError(data: SerializedError) {
+  const ErrorKlass = data.isUsage ? UsageError : Error;
+  const error = new ErrorKlass(data.message);
+  error.stack = data.stack;
+  return error;
 }
