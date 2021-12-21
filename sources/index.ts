@@ -1,5 +1,6 @@
 import {fork}                                                        from 'child_process';
 import {BaseContext, Cli, Command, CommandClass, Option, UsageError} from 'clipanion';
+import {Server, createServer}                                        from 'http';
 import {PassThrough}                                                 from 'stream';
 import tty                                                           from 'tty';
 import WebSocket, {WebSocketServer}                                  from 'ws';
@@ -29,10 +30,12 @@ export type DaemonContext = BaseContext & {
 };
 
 export type DaemonOptions = {
+  server?: Server;
   port: number;
 };
 
 export class Daemon<Context extends DaemonContext = DaemonContext> {
+  public server: Server;
   public port: number;
 
   public readonly env: Record<string, string> = {};
@@ -56,7 +59,8 @@ export class Daemon<Context extends DaemonContext = DaemonContext> {
     reject: (err: Error) => void;
   }>();
 
-  constructor({port}: DaemonOptions) {
+  constructor({server, port}: DaemonOptions) {
+    this.server = server ?? createServer();
     this.port = port;
   }
 
@@ -297,7 +301,7 @@ export class Daemon<Context extends DaemonContext = DaemonContext> {
     log(`server starting`);
     return new Promise<void>((resolve, reject) => {
       const wss = this.wss = new WebSocketServer({
-        port: this.port,
+        server: this.server,
       });
 
       wss.on(`listening`, async () => {
@@ -401,6 +405,8 @@ export class Daemon<Context extends DaemonContext = DaemonContext> {
 
         resolve();
       });
+
+      this.server.listen(this.port);
     });
   }
 
